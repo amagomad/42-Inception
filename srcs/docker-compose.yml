@@ -1,62 +1,74 @@
 version: "3.8"
 
-services:
-	mariadb:
-		build: ./requirements/mariadb
-		container_name: srcs-mariadb-1
-		restart: unless-stopped
-		networks: [inception]
-		volumes:
-			- srcs_db_data:/var/lib/mysql
-			- ../secrets:/run/secrets:ro
-		environment:
-			DB_NAME: wordpress
-			DB_USER: wpuser
-			DB_HOST: mariadb
-		expose:
-			- "3306"
-
-	wordpress:
-		build: ./requirements/wordpress
-		container_name: srcs-wordpress-1
-		restart: unless-stopped
-		depends_on: [mariadb]
-		networks: [inception]
-		volumes:
-			- srcs_wp_data:/var/www/html
-			- ../secrets:/run/secrets:ro
-		environment:
-			DB_NAME: wordpress
-			DB_USER: wpuser
-			DB_HOST: mariadb:3306
-		expose:
-			- "9000"
-
-	nginx:
-		build: ./requirements/nginx
-		container_name: srcs-nginx-1
-		restart: unless-stopped
-		depends_on: [wordpress]
-		networks: [inception]
-		ports:
-			- "443:443"
-		volumes:
-			- srcs_wp_data:/var/www/html
+volumes:
+  wp_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/${LOGIN}/inception/data/wordpress
+  db_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/${LOGIN}/inception/data/mariadb
 
 networks:
-	inception:
-		driver: bridge
+  inception:
+    name: inception
 
-volumes:
-	srcs_wp_data:
-		driver: local
-		driver_opts:
-			type: none
-			o: bind
-			device: ../data/wordpress
-	srcs_db_data:
-		driver: local
-		driver_opts:
-			type: none
-			o: bind
-			device: ../data/mariadb
+secrets:
+  db_password:
+    file: ../secrets/db_password.txt
+  db_root_password:
+    file: ../secrets/db_root_password.txt
+
+services:
+  mariadb:
+    build: ./requirements/mariadb
+    image: mariadb_local:1.0
+    env_file: .env
+    environment:
+      # chemins des secrets dans le container
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+    secrets:
+      - db_password
+      - db_root_password
+    volumes:
+      - db_data:/var/lib/mysql
+    networks: [inception]
+    restart: unless-stopped
+
+  wordpress:
+    build: ./requirements/wordpress
+    image: wordpress_local:1.0
+    env_file: .env
+    environment:
+      # ces envs serviront à l'install via l'UI WP (ou plus tard si tu automatises avec wp-cli)
+      WORDPRESS_DB_HOST: mariadb
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE}
+      WORDPRESS_DB_USER: ${MYSQL_USER}
+      WORDPRESS_DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    depends_on:
+      - mariadb
+    volumes:
+      - wp_data:/var/www/html
+    networks: [inception]
+    restart: unless-stopped
+
+  nginx:
+    build: ./requirements/nginx
+    image: nginx_tls_local:1.0
+    env_file: .env
+    depends_on:
+      - wordpress
+    ports:
+      - "443:443"     # unique point d’entrée
+    volumes:
+      - wp_data:/var/www/html   # même fichiers que WordPress
+    networks: [inception]
+    restart: unless-stopped

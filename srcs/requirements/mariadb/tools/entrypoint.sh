@@ -1,31 +1,48 @@
 #!/bin/sh
 set -e
 
-echo "[db] boot…"
+# Lire les secrets si fournis (sinon garder les envs)
+[ -n "$MYSQL_ROOT_PASSWORD_FILE" ] && [ -f "$MYSQL_ROOT_PASSWORD_FILE" ] && MYSQL_ROOT_PASSWORD="$(cat "$MYSQL_ROOT_PASSWORD_FILE")"
+[ -n "$MYSQL_PASSWORD_FILE" ] && [ -f "$MYSQL_PASSWORD_FILE" ] && MYSQL_PASSWORD="$(cat "$MYSQL_PASSWORD_FILE")"
 
-DB_NAME="${DB_NAME:-wordpress}"
-DB_USER="${DB_USER:-wpuser}"
-DB_PASS="$(cat /run/secrets/db_password.txt 2>/dev/null || true)"
-DB_ROOT_PASS="$(cat /run/secrets/db_root_password.txt 2>/dev/null || true)"
+# Prépare les répertoires runtime/datadir
+mkdir -p /run/mysqld
+chown -R mysql:mysql /run/mysqld /var/lib/mysql
 
-if [ -z "$DB_PASS" ] || [ -z "$DB_ROOT_PASS" ]; then
-  echo "[db] ERROR: secrets manquants dans /run/secrets"
-  exit 1
-fi
+# Si la base système n'existe pas, on initialise le datadir
+if [ ! -d "/var/lib/mysql/mysql" ]; then
+  echo "[mariadb] Initialisation du datadir..."
+  mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db >/dev/null
 
-if [ ! -d /var/lib/mysql/mysql ]; then
-  echo "[db] init datadir"
-  mariadb-install-db --user=mysql --datadir=/var/lib/mysql > /dev/null
+  # Démarre mysqld en local (pas de réseau) pour configurer root/DB/user
+  mysqld --user=mysql --datadir=/var/lib/mysql --skip-networking &
+  pid="$!"
 
-  echo "[db] bootstrap SQL"
-  mysqld --user=mysql --bootstrap <<-SQL
-    ALTER USER 'root'@'localhost' IDENTIFIED BY '${DB_ROOT_PASS}';
-    CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';
-    GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%';
+  # Attend que le socket réponde
+  for i in $(seq 1 30); do
+    mariadb -uroot --socket=/run/mysqld/mysqld.sock -e "SELECT 1" >/dev/null 2>&1 && break
+    sleep 1
+  done
+
+  # Valeurs par défaut si non fournies (pratique en test docker run)
+  : "${MYSQL_DATABASE:=wordpress}"
+  : "${MYSQL_USER:=wp_user}"
+  : "${MYSQL_PASSWORD:=wp_pass}"
+  : "${MYSQL_ROOT_PASSWORD:=rootpass}"
+
+  echo "[mariadb] Création DB/utilisateur..."
+  mariadb -uroot --socket=/run/mysqld/mysqld.sock <<-SQL
+    ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+    CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${MYSQL_PASSWORD}';
+    GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${MYSQL_USER}'@'%';
     FLUSH PRIVILEGES;
 SQL
+
+  # Coupe le mysqld temporaire
+  kill "$pid"; wait "$pid" 2>/dev/null || true
 fi
 
-echo "[db] start mysqld"
-exec mysqld --user=mysql
+# Lance le serveur "pour de vrai" en avant-plan (PID1)
+exec mysqld --user=mysql --datadir=/var/lib/mysql --console
+
